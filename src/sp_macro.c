@@ -540,6 +540,8 @@ static const pm_node_t *g_mx_blk;
 static int mx_emit_block(MxCtx *c, Mv blk, const char *target);
 /* a class or module's ivars and constants as the walk knows them (own: its path without the leading `::`) */
 static int mx_own_iv_get(const char *own, const char *name, Mv *out);   /* 1 set, 0 not set, -1 unknown */
+static int mx_own_iv_set(const char *own, const char *name, Mv v);
+static int mx_run_extended(const char *x_path, const char *base_own);
 static int mx_own_const_known(const char *own, const char *name);         /* 1 known, 0 no such constant anywhere, -1 not sure */
 static void mx_own_const_add(const char *own, const char *name);
 static int mx_template_writes(const char *code);
@@ -1705,7 +1707,15 @@ static int mx_exec(MxCtx *c, pm_node_t *n) {
       free(text);
       if (tp) sf = mx_sf_find(tp, name);
     }
-    if ((recv_own || (self_recv && c->clspath)) && !sf && (strcmp(name, "module_eval") == 0 || strcmp(name, "class_eval") == 0) &&
+    if (recv_own && !sf && !cn->block && (strcmp(name, "instance_variable_set") == 0) && argc == 2 && mx_prim_builtin(name)) {
+      /* `base.instance_variable_set(:@x, v)` on a class the walk follows */
+      Mv a0, a1;
+      char *rn = mx_name(((pm_local_variable_read_node_t *)cn->receiver)->name);
+      Mv *rp = mx_lookup(c->loc, c->nloc, rn); free(rn);
+      if (mx_eval(c, args->nodes[0], &a0) && a0.k == MV_SYM && mx_sym_plain_ci(a0.s) && mx_eval(c, args->nodes[1], &a1) &&
+          mx_own_iv_set(rp->s, a0.s, a1)) { c->ret = a1; ok = 1; }
+    }
+    else if ((recv_own || (self_recv && c->clspath)) && !sf && (strcmp(name, "module_eval") == 0 || strcmp(name, "class_eval") == 0) &&
         argc == 0 && cn->block && PM_NODE_TYPE(cn->block) == PM_BLOCK_ARGUMENT_NODE && mx_prim_builtin(name)) {
       /* `class_eval(&blk)`, `mod.module_eval(&blk)`: the block's body, in that module's body */
       Mv bv;
@@ -1724,6 +1734,21 @@ static int mx_exec(MxCtx *c, pm_node_t *n) {
       Mv r;
       ok = c->depth < 16 && mx_call_macro(c, sf, cn->arguments, &r);
       if (ok) c->ret = r;
+    }
+    else if (!m && !sf && argc == 1 && !cn->block && strcmp(name, "<<") == 0 && cn->receiver &&
+             PM_NODE_TYPE(cn->receiver) == PM_CALL_NODE && mx_prim_builtin("instance_variable_get") &&
+             ({ pm_call_node_t *g = (pm_call_node_t *)cn->receiver; char *gn = mx_name(g->name);
+                int hit = strcmp(gn, "instance_variable_get") == 0 && g->receiver && g->arguments && g->arguments->arguments.size == 1 && !g->block; free(gn); hit; })) {
+      /* `base.instance_variable_get(:@x) << v` on a class the walk follows */
+      pm_call_node_t *g = (pm_call_node_t *)cn->receiver;
+      Mv ro, a0, cur, v;
+      if (mx_eval(c, g->receiver, &ro) && ro.k == MV_OWN && mx_eval(c, g->arguments->arguments.nodes[0], &a0) && a0.k == MV_SYM &&
+          mx_sym_plain_ci(a0.s) && mx_own_iv_get(ro.s, a0.s, &cur) == 1 && cur.k == MV_ARR && mx_eval(c, args->nodes[0], &v)) {
+        Mv nv = mv_nil(); nv.k = MV_ARR; nv.a = calloc((size_t)cur.n + 2, sizeof(Mv)); nv.n = cur.n + 1;
+        for (int q = 0; q < cur.n; q++) nv.a[q] = cur.a[q];
+        nv.a[cur.n] = v;
+        if (mx_own_iv_set(ro.s, a0.s, nv)) { c->ret = nv; ok = 1; }
+      }
     }
     else if (m) {
       Mv r;
@@ -2747,7 +2772,7 @@ static int mx_is_tracked(const pm_node_t *n) {
   return g_mx_ntracked && bsearch(&n, g_mx_tracked, (size_t)g_mx_ntracked, sizeof *g_mx_tracked, mx_ptr_cmp) != NULL;
 }
 
-typedef struct { int skip_writes; } MxPoisonScan;
+typedef struct { int skip_writes; int local_ok; } MxPoisonScan;   /* local_ok: `x.instance_variable_set` on a local is a class value a hook's run follows */
 
 /* the macros a call or a mention of this name may reach: what they may write,
    given the arguments of the call when it has them */
@@ -2778,6 +2803,18 @@ static bool mx_poison_visit(const pm_node_t *n, void *data) {
       for (size_t i = 0; i < st->body.size; i++) {
         pm_node_t *s = st->body.nodes[i];
         if (PM_NODE_TYPE(s) == PM_DEF_NODE && !((pm_def_node_t *)s)->receiver) continue;
+        if (PM_NODE_TYPE(s) == PM_DEF_NODE && PM_NODE_TYPE(((pm_def_node_t *)s)->receiver) == PM_SELF_NODE) {
+          char *dn = mx_name(((pm_def_node_t *)s)->name);
+          int hook = strcmp(dn, "extended") == 0;
+          free(dn);
+          if (hook) {
+            MxPoisonScan in = { ps->skip_writes, 1 };
+            pm_def_node_t *d = (pm_def_node_t *)s;
+            if (d->parameters) pm_visit_node((pm_node_t *)d->parameters, mx_poison_visit, &in);
+            if (d->body) pm_visit_node(d->body, mx_poison_visit, &in);
+            continue;
+          }
+        }
         pm_visit_node(s, mx_poison_visit, ps);
       }
     }
@@ -2791,7 +2828,7 @@ static bool mx_poison_visit(const pm_node_t *n, void *data) {
       for (size_t i = 0; i < st->body.size; i++) {
         pm_node_t *s = st->body.nodes[i];
         if (PM_NODE_TYPE(s) == PM_DEF_NODE && !((pm_def_node_t *)s)->receiver) {
-          MxPoisonScan in = { 1 };
+          MxPoisonScan in = { 1, 0 };
           pm_def_node_t *d = (pm_def_node_t *)s;
           if (d->parameters) pm_visit_node((pm_node_t *)d->parameters, mx_poison_visit, &in);
           if (d->body) pm_visit_node(d->body, mx_poison_visit, &in);
@@ -2824,7 +2861,9 @@ static bool mx_poison_visit(const pm_node_t *n, void *data) {
     }
     const char *eff = tgt && snd ? tgt : nm;
     if (mx_ivar_call(eff)) {
-      if (!(ps->skip_writes && !cn->receiver)) {
+      /* a macro's own writes are followed; so is `base.instance_variable_set(:@x, v)` on a class value a hook holds */
+      if (!((ps->skip_writes && !cn->receiver) ||
+            (ps->local_ok && cn->receiver && PM_NODE_TYPE(cn->receiver) == PM_LOCAL_VARIABLE_READ_NODE && strcmp(eff, "instance_variable_set") == 0))) {
         char *a0 = argc > a0i ? mx_sym_or_str(cn->arguments->arguments.nodes[a0i]) : NULL;
         if (a0) { mx_names_add(&g_mx_poison, a0); free(a0); } else g_mx_poison_all = 1;
       }
@@ -3167,6 +3206,12 @@ static int mx_own_iv_get(const char *own, const char *name, Mv *out) {
   *out = *v;
   return 1;
 }
+static int mx_own_iv_set(const char *own, const char *name, Mv v) {
+  MxClass *k = mx_own_class(own);
+  if (!k || k->unknown || k->noiv) return 0;
+  mx_set(k->iv, &k->niv, 64, name, v);
+  return mx_lookup(k->iv, k->niv, name) != NULL;
+}
 static int mx_own_const_known(const char *own, const char *name) {
   MxClass *k = mx_own_class(own);
   if (k && mx_names_has(&k->consts, name)) return 1;
@@ -3179,6 +3224,33 @@ static int mx_own_const_known(const char *own, const char *name) {
 static void mx_own_const_add(const char *own, const char *name) {
   MxClass *k = mx_own_class(own);
   if (k) mx_names_add(&k->consts, name);
+}
+
+static int mx_run_def(MxCtx *sub, MxMacro *m, const char *arg0) {
+  pm_parameters_node_t *ps = m->def->parameters;
+  if (!ps || ps->requireds.size != 1 || ps->optionals.size || ps->rest || ps->keywords.size || ps->keyword_rest || ps->block ||
+      PM_NODE_TYPE(ps->requireds.nodes[0]) != PM_REQUIRED_PARAMETER_NODE) return 0;
+  Mv bv = mv_str(arg0, strlen(arg0), MV_STR); bv.k = MV_OWN;
+  char *nm = mx_name(((pm_required_parameter_node_t *)ps->requireds.nodes[0])->name);
+  mx_set(sub->loc, &sub->nloc, 64, nm, bv); free(nm);
+  sub->mbody = m->def->body;
+  sub->ret = mv_nil();
+  pm_node_t *body = m->def->body;
+  if (!body) return 1;
+  return PM_NODE_TYPE(body) == PM_STATEMENTS_NODE ? mx_exec_stmts(sub, (pm_statements_node_t *)body) : mx_exec(sub, body);
+}
+
+static int mx_run_extended(const char *xp, const char *base_own) {
+  MxMacro *m = mx_sf_find(xp, "extended");
+  MxClass *bk = mx_own_class(base_own);
+  if (!m || !bk) return 0;
+  MxVar bsave[64]; int bnsave = bk->niv;
+  memcpy(bsave, bk->iv, sizeof(MxVar) * (size_t)bnsave);
+  MxCtx sub; memset(&sub, 0, sizeof sub);
+  sub.modname = m->module; sub.in_sf = 1; sub.depth = 1;
+  int ok = mx_run_def(&sub, m, base_own);
+  if (!ok) { memcpy(bk->iv, bsave, sizeof(MxVar) * (size_t)bnsave); bk->niv = bnsave; }
+  return ok;
 }
 
 /* Does the class-body call `name` of class k reach the macro m: a
@@ -3475,6 +3547,8 @@ static void mx_class_body(pm_statements_node_t *st, MxEdits *ed, MxClass *k, int
           k->ext = realloc(k->ext, sizeof(char *) * (size_t)(k->next + 1));
           k->ext[k->next++] = mp;
         }
+        /* the module's own `extended(base)` runs at the statement */
+        if (mp && mx_sf_find(mp, "extended") && !k->unknown && !mx_run_extended(mp, k->path + 2)) k->unknown = 1;
       }
       free(name);
       continue;
@@ -3841,7 +3915,7 @@ static char *sp_expand_class_macros(const char *source) {
     { MxAliasScan as = { 0, "", 1 }; pm_visit_node(root, mx_alias_visit, &as); mx_settle_aliases(); }
     { MxEdits none = {0}; MxWalk mw = { &none, "", 1, 0 }; pm_visit_node(root, mx_class_visit, &mw); }
     mx_sort_tracked();
-    { MxPoisonScan ps = { 0 }; pm_visit_node(root, mx_poison_visit, &ps); }
+    { MxPoisonScan ps = { 0, 0 }; pm_visit_node(root, mx_poison_visit, &ps); }
     pm_visit_node(root, mx_attr_visit, NULL);
     if (getenv("SPINEL_MACRO_DEBUG")) {
       for (int i = 0; i < g_mx_poison.n; i++) fprintf(stderr, "poisoned ivar: %s\n", g_mx_poison.v[i]);
