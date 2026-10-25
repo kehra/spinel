@@ -99,6 +99,8 @@ typedef struct {
   int own_class;          /* the macro is a `def self.m` of the class it expands in */
   const char *clspath;    /* the name of the class it expands in, when `class X` spells it for certain */
   int in_sf;              /* running a module's `def self.m` (a helper): `self` is not the class */
+  const char *expand_own; /* the class whose body the output lands in, when not clspath (a module hook run for an includer) */
+  int in_hook;            /* running a module's `append_features`: `super` is the plain include */
   const pm_node_t *blk;   /* the block literal of the call being run */
 } MxCtx;
 
@@ -542,6 +544,9 @@ static int mx_emit_block(MxCtx *c, Mv blk, const char *target);
 static int mx_own_iv_get(const char *own, const char *name, Mv *out);   /* 1 set, 0 not set, -1 unknown */
 static int mx_own_iv_set(const char *own, const char *name, Mv v);
 static int mx_run_extended(const char *x_path, const char *base_own);
+static int mx_own_inherits(const char *base, const char *mod);            /* `base < mod`: 1, 0, -1 */
+static void mx_own_inc_add(const char *own, const char *mod);
+static int mx_run_features(MxCtx *parent, const char *mod_path, const char *base_own, MxBuf *out);
 static int mx_own_const_known(const char *own, const char *name);         /* 1 known, 0 no such constant anywhere, -1 not sure */
 static void mx_own_const_add(const char *own, const char *name);
 static int mx_template_writes(const char *code);
@@ -874,7 +879,7 @@ static int mx_eval_call(MxCtx *c, pm_call_node_t *n, Mv *out) {
             char *pp = malloc(strlen(c->clspath) + strlen(a0.s) + 3);
             sprintf(pp, "%s::%s", c->clspath, a0.s);
             mx_own_const_add(c->clspath, a0.s);
-            if (c->out) { mxb_puts(c->out, "module "); mxb_puts(c->out, a0.s); mxb_puts(c->out, "\nend\n"); ok = 1; }
+            if (c->out && (!c->expand_own || strcmp(c->expand_own, c->clspath) == 0)) { mxb_puts(c->out, "module "); mxb_puts(c->out, a0.s); mxb_puts(c->out, "\nend\n"); ok = 1; }
             else if (!c->out) ok = 1;
             *out = mv_str(pp, strlen(pp), MV_STR); out->k = MV_OWN; free(pp);
           }
@@ -915,6 +920,13 @@ static int mx_eval_call(MxCtx *c, pm_call_node_t *n, Mv *out) {
           else *out = rr ? got : mv_nil();
           ok = 1;
         }
+      }
+    }
+    else if (argc == 1 && strcmp(name, "<") == 0 && mx_prim_builtin(name)) {
+      Mv a0;
+      if (mx_eval(c, args->nodes[0], &a0) && a0.k == MV_OWN) {
+        int rr = mx_own_inherits(r.s, a0.s);
+        if (rr >= 0) { *out = mv_nil(); out->k = rr ? MV_TRUE : MV_FALSE; ok = 1; }
       }
     }
     goto done;
@@ -1548,7 +1560,7 @@ static int mx_is_raise(pm_node_t *n) {
 static int mx_emit_block(MxCtx *c, Mv blk, const char *target) {
   const pm_block_node_t *b = (const pm_block_node_t *)blk.p;
   if (!b || !c->out || b->parameters) return 0;
-  const char *here = c->clspath;
+  const char *here = c->expand_own ? c->expand_own : c->clspath;
   if (!here || !target) return 0;
   size_t hl = strlen(here);
   int same = strcmp(here, target) == 0;
@@ -1678,6 +1690,14 @@ static int mx_exec(MxCtx *c, pm_node_t *n) {
     mxb_puts(o, "end\n");
     return 1;
   }
+  case PM_FORWARDING_SUPER_NODE: {
+    /* `super` in a module's append_features: Module's own, the plain include */
+    if (!c->in_hook || !c->clspath || !o || !c->expand_own) return 0;
+    mxb_puts(o, "include ::"); mxb_puts(o, c->clspath); mxb_puts(o, "\n");
+    mx_own_inc_add(c->expand_own, c->clspath);
+    c->ret = mv_nil();
+    return 1;
+  }
   case PM_CALL_NODE: {
     pm_call_node_t *cn = (pm_call_node_t *)n;
     char *name = mx_name(cn->name);
@@ -1728,6 +1748,24 @@ static int mx_exec(MxCtx *c, pm_node_t *n) {
       if (ex && mx_eval(c, ex, &bv) && bv.k == MV_BLK) ok = mx_emit_block(c, bv, target);
       else if (ex && mx_eval(c, ex, &bv) && bv.k == MV_NIL) ok = 1;
       if (ok) c->ret = mv_nil();
+    }
+    else if (recv_own && !sf && argc == 1 && !cn->block && (strcmp(name, "extend") == 0 || strcmp(name, "include") == 0) && mx_prim_builtin(name)) {
+      /* `base.extend(Mod)` / `base.include(Mod)`: the same call in the body the output lands in */
+      Mv rv0, a0;
+      char *rn = mx_name(((pm_local_variable_read_node_t *)cn->receiver)->name);
+      Mv *rp = mx_lookup(c->loc, c->nloc, rn); free(rn);
+      rv0 = *rp;
+      if (mx_eval(c, args->nodes[0], &a0) && a0.k == MV_OWN && c->out && c->expand_own && strcmp(rv0.s, c->expand_own) == 0) {
+        if (name[0] == 'e') {
+          mxb_puts(c->out, "extend ::"); mxb_puts(c->out, a0.s); mxb_puts(c->out, "\n"); ok = 1;
+        }
+        else {
+          char *mp = malloc(strlen(a0.s) + 3); sprintf(mp, "::%s", a0.s);
+          ok = c->depth < 16 && mx_run_features(c, mp, rv0.s, c->out);
+          free(mp);
+        }
+        if (ok) c->ret = mv_nil();
+      }
     }
     else if (sf) {
       /* `Const.helper(args)`: the helper runs here, the class a value */
@@ -2024,6 +2062,7 @@ static int mx_call_macro(MxCtx *c, MxMacro *m, pm_arguments_node_t *argn, Mv *re
   sub.modname = m->module; sub.own_class = m->self_def == 1; sub.clspath = c->clspath;
   sub.in_sf = m->self_def == 2;
   sub.mbody = m->def->body;
+  sub.expand_own = c->expand_own;
   sub.blk = g_mx_blk; g_mx_blk = NULL;
   if (!mx_bind_params(c, &sub, m, argn, 1)) return 0;
   sub.ret = mv_nil();
@@ -3178,6 +3217,7 @@ typedef struct {
   const char *clsname;          /* its name while a `class X` body that names it for certain is walked */
   int noiv;                     /* this body may run out of order, or be another class's: no state */
   MxVar iv[64]; int niv;        /* the ivars its macros keep, as the evaluator follows them */
+  MxNames inc;                  /* the modules it includes (paths without `::`), as a hook or an include said */
   MxNames consts;               /* modules a `const_set(:X, Module.new)` of its macros made (X) */
 } MxClass;
 static MxClass *g_mx_classes; static int g_mx_nclasses;
@@ -3218,6 +3258,32 @@ static int mx_own_iv_set(const char *own, const char *name, Mv v) {
   mx_set(k->iv, &k->niv, 64, name, v);
   return mx_lookup(k->iv, k->niv, name) != NULL;
 }
+static void mx_own_inc_add(const char *own, const char *mod) {
+  MxClass *k = mx_own_class(own);
+  if (k) mx_names_add(&k->inc, mod);
+}
+static int mx_own_includes(MxClass *k, const char *mod, int depth) {
+  if (depth > 16) return -1;
+  if (mx_names_has(&k->inc, mod)) return 1;
+  int r = 0;
+  for (int i = 0; i < k->inc.n; i++) {
+    MxClass *d = mx_own_class(k->inc.v[i]);
+    if (!d) { r = -1; continue; }
+    int q = mx_own_includes(d, mod, depth + 1);
+    if (q == 1) return 1;
+    if (q < 0) r = -1;
+  }
+  return r;
+}
+static int mx_own_inherits(const char *base, const char *mod) {
+  MxClass *k = mx_own_class(base);
+  if (!k || k->unknown) return -1;
+  if (strcmp(base, mod) == 0) return 0;
+  int r = mx_own_includes(k, mod, 0);
+  if (r == 0 && k->super) return -1;
+  return r;
+}
+
 static int mx_own_const_known(const char *own, const char *name) {
   MxClass *k = mx_own_class(own);
   if (k && mx_names_has(&k->consts, name)) return 1;
@@ -3244,6 +3310,31 @@ static int mx_run_def(MxCtx *sub, MxMacro *m, const char *arg0) {
   pm_node_t *body = m->def->body;
   if (!body) return 1;
   return PM_NODE_TYPE(body) == PM_STATEMENTS_NODE ? mx_exec_stmts(sub, (pm_statements_node_t *)body) : mx_exec(sub, body);
+}
+
+static int mx_run_features(MxCtx *parent, const char *mp, const char *base_own, MxBuf *out) {
+  MxClass *k = mx_class_find(mp);
+  MxClass *bk = mx_own_class(base_own);
+  if (!k || !bk || k->unknown) return 0;
+  MxMacro *m = NULL;
+  for (int q = 0; q < k->next && !m; q++) { m = mx_find_macro(k->ext[q], "append_features"); if (m && m->self_def) m = NULL; }
+  if (!m) {                       /* Module's own append_features */
+    mxb_puts(out, "include ::"); mxb_puts(out, mp + 2); mxb_puts(out, "\n");
+    mx_names_add(&bk->inc, mp + 2);
+    return 1;
+  }
+  MxVar ksave[64], bsave[64]; int knsave = k->niv, bnsave = bk->niv;
+  memcpy(ksave, k->iv, sizeof(MxVar) * (size_t)knsave); memcpy(bsave, bk->iv, sizeof(MxVar) * (size_t)bnsave);
+  MxCtx sub; memset(&sub, 0, sizeof sub);
+  sub.out = out; sub.depth = parent ? parent->depth + 1 : 0;
+  sub.iv = k->iv; sub.niv = &k->niv; sub.unsure = &k->unknown;
+  sub.modname = m->module; sub.clspath = mp + 2; sub.expand_own = base_own; sub.in_hook = 1;
+  int ok = sub.depth < 16 && mx_run_def(&sub, m, base_own);
+  if (!ok) {
+    memcpy(k->iv, ksave, sizeof(MxVar) * (size_t)knsave); k->niv = knsave;
+    memcpy(bk->iv, bsave, sizeof(MxVar) * (size_t)bnsave); bk->niv = bnsave;
+  }
+  return ok;
 }
 
 static int mx_run_extended(const char *xp, const char *base_own) {
@@ -3587,6 +3678,27 @@ static void mx_class_body(pm_statements_node_t *st, MxEdits *ed, MxClass *k, int
         const char *mp = mx_resolve_const(k->path, text);
         free(text);
         if (mp) mx_hook_extends(k, mp);
+        MxClass *mk = mp ? mx_class_find(mp) : NULL;
+        MxMacro *af = NULL;
+        for (int q = 0; mk && q < mk->next && !af; q++) { af = mx_find_macro(mk->ext[q], "append_features"); if (af && af->self_def) af = NULL; }
+        if (af && cn->arguments->arguments.size == 1 && !k->unknown && !k->vis) {
+          /* `include M` runs M's `append_features(base)`: what it does to this class is the text here */
+          MxBuf out = {0};
+          int ok = mx_run_features(NULL, mp, k->path + 2, &out);
+          char *body = ok ? mx_join_residual(out.p ? out.p : "") : NULL;
+          if (body) {
+            int lines = 0;
+            for (const uint8_t *p = s->location.start; p < s->location.end; p++) if (*p == '\n') lines++;
+            MxBuf rep = {0};
+            mxb_puts(&rep, body);
+            for (int q = 0; q < lines; q++) mxb_puts(&rep, "\n");
+            mx_note_generated(body, &k->gen);
+            if (ed->n == ed->cap) { ed->cap = ed->cap ? ed->cap * 2 : 32; ed->e = realloc(ed->e, sizeof(MxEdit) * (size_t)ed->cap); }
+            ed->e[ed->n].start = s->location.start; ed->e[ed->n].end = s->location.end; ed->e[ed->n].text = rep.p; ed->n++;
+          } else k->unknown = 1;
+          free(body); free(out.p);
+        }
+        else if (mp) mx_names_add(&k->inc, mp + 2);
       }
     }
     if (strcmp(name, "extend") == 0 && cn->arguments) {
