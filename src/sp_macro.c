@@ -1518,8 +1518,13 @@ static int mx_bind_params(MxCtx *c, MxCtx *sub, MxMacro *m, pm_arguments_node_t 
       return !strict;
   pm_parameters_node_t *ps = m->def->parameters;
   size_t nreq = ps ? ps->requireds.size : 0, nopt = ps ? ps->optionals.size : 0;
-  if (ps && (ps->rest || ps->posts.size || ps->keyword_rest || ps->block)) return !strict;
-  if (argc < nreq || argc > nreq + nopt) return !strict;
+  /* `*names` takes the positionals left after the required and optional ones;
+     only a named, plain rest is followed (`*`, `**opts`, `&blk` and trailing
+     required parameters are not) */
+  pm_rest_parameter_node_t *rest = ps && ps->rest && PM_NODE_TYPE(ps->rest) == PM_REST_PARAMETER_NODE
+                                   ? (pm_rest_parameter_node_t *)ps->rest : NULL;
+  if (ps && ((ps->rest && !(rest && rest->name)) || ps->posts.size || ps->keyword_rest || ps->block)) return !strict;
+  if (argc < nreq || (!rest && argc > nreq + nopt)) return !strict;
   size_t ai = 0;
   for (size_t i = 0; i < nreq; i++, ai++) {
     Mv v;
@@ -1535,6 +1540,15 @@ static int mx_bind_params(MxCtx *c, MxCtx *sub, MxMacro *m, pm_arguments_node_t 
     else if (!mx_eval(sub, op->value, &v)) { if (strict) return 0; continue; }
     char *nm = mx_name(op->name);
     mx_set(sub->loc, &sub->nloc, 64, nm, v); free(nm);
+  }
+  if (rest) {
+    Mv av = mv_nil(); av.k = MV_ARR; av.a = calloc((argc > ai ? argc - ai : 0) + 1, sizeof(Mv)); av.n = 0;
+    int bound = 1;
+    for (; ai < argc; ai++) {
+      if (!mx_eval(c, args->nodes[ai], &av.a[av.n])) { if (strict) return 0; bound = 0; break; }
+      av.n++;
+    }
+    if (bound) { char *nm = mx_name(rest->name); mx_set(sub->loc, &sub->nloc, 64, nm, av); free(nm); }
   }
   size_t nkw = ps ? ps->keywords.size : 0;
   if (kw && nkw == 0) return !strict;
