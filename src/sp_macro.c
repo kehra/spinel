@@ -409,6 +409,11 @@ static int mx_prim_builtin(const char *name) {
 
 /* ---- the class's macro state: the instance variables its macros keep ---- */
 
+static int mx_sym_plain_ci(const char *t) {
+  if (!t || !*t) return 0;
+  for (const char *q = t; *q; q++) if (!(isalnum((unsigned char)*q) || *q == '_' || *q == '@' || *q == '?' || *q == '!')) return 0;
+  return 1;
+}
 static int mx_poisoned(const char *ivar) { return g_mx_poison_all || mx_names_has(&g_mx_poison, ivar); }
 
 /* some macro of this name may write an instance variable */
@@ -533,6 +538,10 @@ static int mx_residual(MxCtx *c, pm_node_t *n, MxBuf *b);
 static int mx_call_macro(MxCtx *c, MxMacro *m, pm_arguments_node_t *args, Mv *ret);
 static const pm_node_t *g_mx_blk;
 static int mx_emit_block(MxCtx *c, Mv blk, const char *target);
+/* a class or module's ivars and constants as the walk knows them (own: its path without the leading `::`) */
+static int mx_own_iv_get(const char *own, const char *name, Mv *out);   /* 1 set, 0 not set, -1 unknown */
+static int mx_own_const_known(const char *own, const char *name);         /* 1 known, 0 no such constant anywhere, -1 not sure */
+static void mx_own_const_add(const char *own, const char *name);
 static int mx_template_writes(const char *code);
 static int mx_node_writes_ivar(const pm_node_t *n);
 static void mx_poison_writes_in(const pm_node_t *body);
@@ -820,6 +829,57 @@ static int mx_eval_call(MxCtx *c, pm_call_node_t *n, Mv *out) {
              !mx_names_has(&g_mx_defs, name) && !mx_names_has(&g_mx_hidden, name)) {
       *out = mv_nil(); out->k = MV_OPQ; ok = 1;
     }
+    /* what the module itself is asked: its ivars and constants */
+    else if (!m && c->clspath && !c->in_sf && argc >= 1 && !(n->receiver && PM_NODE_TYPE(n->receiver) != PM_SELF_NODE) &&
+             (strcmp(name, "instance_variable_defined?") == 0 || strcmp(name, "instance_variable_get") == 0 ||
+              strcmp(name, "const_defined?") == 0 || strcmp(name, "const_get") == 0 || strcmp(name, "const_set") == 0) &&
+             mx_prim_builtin(name)) {
+      Mv a0;
+      int isiv = name[0] == 'i';
+      if (mx_eval(c, args->nodes[0], &a0) && a0.k == MV_SYM && mx_sym_plain_ci(a0.s)) {
+        if (isiv) {
+          Mv got; int r = mx_own_iv_get(c->clspath, a0.s, &got);
+          if (c->iv && !mx_poisoned(a0.s) && r >= 0 && argc == 1) {
+            if (name[18] == 'd') { *out = mv_nil(); out->k = r ? MV_TRUE : MV_FALSE; ok = 1; }
+            else { *out = r ? got : mv_nil(); ok = 1; }
+          }
+        }
+        else if (name[6] == 'd') {            /* const_defined?(:X[, false]) */
+          int inherit = 1; Mv a1;
+          if (argc == 2) { if (!mx_eval(c, args->nodes[1], &a1) || (a1.k != MV_FALSE && a1.k != MV_TRUE)) goto done; inherit = a1.k == MV_TRUE; }
+          if (argc <= 2) {
+            int r = mx_own_const_known(c->clspath, a0.s);
+            if (r < 0 && !inherit) r = 0;
+            if (r == 0 && inherit && mx_names_has(&g_mx_consts, a0.s)) r = -1;
+            if (r >= 0) { *out = mv_nil(); out->k = r ? MV_TRUE : MV_FALSE; ok = 1; }
+          }
+        }
+        else if (name[6] == 'g' && argc == 1) {   /* const_get(:X) of a module of the program */
+          if (mx_own_const_known(c->clspath, a0.s) == 1) {
+            char *pp = malloc(strlen(c->clspath) + strlen(a0.s) + 3);
+            sprintf(pp, "%s::%s", c->clspath, a0.s);
+            *out = mv_str(pp, strlen(pp), MV_STR); out->k = MV_OWN; free(pp); ok = 1;
+          }
+        }
+        else if (name[6] == 's' && argc == 2 && isupper((unsigned char)a0.s[0]) &&
+                 PM_NODE_TYPE(args->nodes[1]) == PM_CALL_NODE) {   /* const_set(:X, Module.new) */
+          pm_call_node_t *mn = (pm_call_node_t *)args->nodes[1];
+          char *mnn = mx_name(mn->name);
+          if (strcmp(mnn, "new") == 0 && !mn->arguments && !mn->block && mn->receiver &&
+              PM_NODE_TYPE(mn->receiver) == PM_CONSTANT_READ_NODE &&
+              strncmp((const char *)mn->receiver->location.start, "Module", 6) == 0 && mn->receiver->location.end - mn->receiver->location.start == 6 &&
+              mx_own_const_known(c->clspath, a0.s) != 1) {
+            char *pp = malloc(strlen(c->clspath) + strlen(a0.s) + 3);
+            sprintf(pp, "%s::%s", c->clspath, a0.s);
+            mx_own_const_add(c->clspath, a0.s);
+            if (c->out) { mxb_puts(c->out, "module "); mxb_puts(c->out, a0.s); mxb_puts(c->out, "\nend\n"); ok = 1; }
+            else if (!c->out) ok = 1;
+            *out = mv_str(pp, strlen(pp), MV_STR); out->k = MV_OWN; free(pp);
+          }
+          free(mnn);
+        }
+      }
+    }
     /* the class's own name: `self.name`, `to_s`, `inspect` (Module's own) */
     else if (!m && c->clspath && !c->in_sf && !argc && (strcmp(name, "name") == 0 || strcmp(name, "to_s") == 0 ||
                                            strcmp(name, "inspect") == 0) && mx_prim_builtin(name) && !g_mx_selfname) {
@@ -844,6 +904,17 @@ static int mx_eval_call(MxCtx *c, pm_call_node_t *n, Mv *out) {
     if (!argc && (strcmp(name, "name") == 0 || strcmp(name, "to_s") == 0 || strcmp(name, "inspect") == 0) &&
         mx_prim_builtin(name) && !g_mx_selfname) { *out = mv_str(r.s, strlen(r.s), MV_STR); ok = 1; }
     else if (!argc && strcmp(name, "singleton_class?") == 0 && mx_prim_builtin(name)) { *out = mv_nil(); out->k = MV_FALSE; ok = 1; }
+    else if (argc == 1 && (strcmp(name, "instance_variable_defined?") == 0 || strcmp(name, "instance_variable_get") == 0) && mx_prim_builtin(name)) {
+      Mv a0; Mv got;
+      if (mx_eval(c, args->nodes[0], &a0) && a0.k == MV_SYM && mx_sym_plain_ci(a0.s)) {
+        int rr = mx_own_iv_get(r.s, a0.s, &got);
+        if (rr >= 0) {
+          if (name[18] == 'd') { *out = mv_nil(); out->k = rr ? MV_TRUE : MV_FALSE; }
+          else *out = rr ? got : mv_nil();
+          ok = 1;
+        }
+      }
+    }
     goto done;
   }
   if (r.k == MV_OPQ) {
@@ -3062,6 +3133,7 @@ typedef struct {
   const char *clsname;          /* its name while a `class X` body that names it for certain is walked */
   int noiv;                     /* this body may run out of order, or be another class's: no state */
   MxVar iv[64]; int niv;        /* the ivars its macros keep, as the evaluator follows them */
+  MxNames consts;               /* modules a `const_set(:X, Module.new)` of its macros made (X) */
 } MxClass;
 static MxClass *g_mx_classes; static int g_mx_nclasses;
 
@@ -3077,6 +3149,36 @@ static MxClass *mx_class_state(const char *path) {
 static MxClass *mx_class_find(const char *path) {
   for (int i = 0; path && i < g_mx_nclasses; i++) if (strcmp(g_mx_classes[i].path, path) == 0) return &g_mx_classes[i];
   return NULL;
+}
+
+/* ---- what a class value is asked: the ivars its macros keep, the constants it has ---- */
+static MxClass *mx_own_class(const char *own) {
+  if (!own) return NULL;
+  char *p = malloc(strlen(own) + 3); sprintf(p, "::%s", own);
+  MxClass *k = mx_class_find(p);
+  free(p);
+  return k;
+}
+static int mx_own_iv_get(const char *own, const char *name, Mv *out) {
+  MxClass *k = mx_own_class(own);
+  if (!k || k->unknown || k->noiv) return -1;
+  Mv *v = mx_lookup(k->iv, k->niv, name);
+  if (!v) return 0;
+  *out = *v;
+  return 1;
+}
+static int mx_own_const_known(const char *own, const char *name) {
+  MxClass *k = mx_own_class(own);
+  if (k && mx_names_has(&k->consts, name)) return 1;
+  char *p = malloc(strlen(own) + strlen(name) + 5); sprintf(p, "::%s::%s", own, name);
+  int hit = mx_names_find(&g_mx_paths, p) != NULL;
+  free(p);
+  if (hit) return 1;
+  return mx_names_has(&g_mx_consts, name) ? -1 : 0;
+}
+static void mx_own_const_add(const char *own, const char *name) {
+  MxClass *k = mx_own_class(own);
+  if (k) mx_names_add(&k->consts, name);
 }
 
 /* Does the class-body call `name` of class k reach the macro m: a
