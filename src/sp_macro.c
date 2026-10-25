@@ -651,6 +651,51 @@ static size_t mx_pat_at(const MxPat *pt, const char *s) {
   return n;
 }
 
+/* ---- the constants a class or module body assigns: what an expansion
+   may read (`Const`, `Owner::Const`) while it runs ---- */
+typedef struct { char *path, *name; pm_node_t *value; } MxCval;
+static MxCval *g_mx_cvals; static int g_mx_ncvals, g_mx_ccvals;
+
+static void mx_add_cval(const char *path, char *name, pm_node_t *value) {
+  if (g_mx_ncvals == g_mx_ccvals) {
+    g_mx_ccvals = g_mx_ccvals ? g_mx_ccvals * 2 : 64;
+    g_mx_cvals = realloc(g_mx_cvals, sizeof(MxCval) * (size_t)g_mx_ccvals);
+  }
+  g_mx_cvals[g_mx_ncvals].path = strdup(path);
+  g_mx_cvals[g_mx_ncvals].name = name;
+  g_mx_cvals[g_mx_ncvals++].value = value;
+}
+/* the path a constant reference `from` spells, innermost scope first */
+static const char *mx_resolve_const(const char *from, const char *text);
+static MxCval *mx_cval_find(const char *from, const char *text) {
+  const char *p = mx_resolve_const(from, text);
+  if (!p) {
+    /* a constant is `Owner::NAME`: split at the last `::` */
+    const char *last = strrchr(text, ':');
+    if (!last || last == text || last[-1] != ':') {
+      size_t fl = strlen(from);
+      char *cand = malloc(fl + strlen(text) + 3);
+      MxCval *r = NULL;
+      for (;;) {
+        for (int i = 0; i < g_mx_ncvals && !r; i++)
+          if (strcmp(g_mx_cvals[i].name, text) == 0 && strlen(g_mx_cvals[i].path) == fl && strncmp(g_mx_cvals[i].path, from, fl) == 0) r = &g_mx_cvals[i];
+        if (r || fl == 0) break;
+        const char *cut = from + fl;
+        while (cut > from && !(cut[-1] == ':' && cut - 1 > from && cut[-2] == ':')) cut--;
+        fl = cut > from ? (size_t)(cut - from) - 2 : 0;
+      }
+      free(cand);
+      return r;
+    }
+    char *owner = strndup(text, (size_t)(last - 1 - text));
+    const char *op = owner[0] ? mx_resolve_const(from, owner) : "";
+    free(owner);
+    if (!op) return NULL;
+    for (int i = 0; i < g_mx_ncvals; i++)
+      if (strcmp(g_mx_cvals[i].name, last + 1) == 0 && strcmp(g_mx_cvals[i].path, op) == 0) return &g_mx_cvals[i];
+  }
+  return NULL;
+}
 /* a literal regex over ASCII, matched against s: literals, `.`, classes, `^ $ \A \z`,
    `*` `+` `?` after a single item. 1 match, 0 none, -1 not followed. */
 static int mx_re_item(const char **pp, const char *e, MxPat *cls, int *kind, unsigned char *ch) {
@@ -1014,6 +1059,20 @@ static int mx_eval(MxCtx *c, pm_node_t *n, Mv *out) {
   /* __LINE__ / __FILE__ are the macro source's: kept as written */
   case PM_SOURCE_LINE_NODE: case PM_SOURCE_FILE_NODE: return 0;
   case PM_CALL_NODE: return mx_eval_call(c, (pm_call_node_t *)n, out);
+  case PM_CONSTANT_READ_NODE: case PM_CONSTANT_PATH_NODE: {
+    /* a constant the program assigns a value the evaluator follows */
+    static int depth;
+    char *text = strndup((const char *)n->location.start, (size_t)(n->location.end - n->location.start));
+    MxCval *cv = depth < 8 ? mx_cval_find(c->modname ? c->modname : "", text) : NULL;
+    free(text);
+    if (!cv) return 0;
+    MxCtx sub; memset(&sub, 0, sizeof sub);
+    sub.modname = cv->path; sub.depth = c->depth + 1;
+    depth++;
+    int ok = mx_eval(&sub, cv->value, out);
+    depth--;
+    return ok;
+  }
   case PM_IF_NODE: {
     /* `c ? a : b`, and an if whose arms are one expression each */
     pm_if_node_t *in = (pm_if_node_t *)n;
@@ -1891,6 +1950,14 @@ static bool mx_attr_dyn_visit(const pm_node_t *n, void *data) {
    calls of its body. */
 static void mx_collect_self_defs(pm_statements_node_t *st, const char *path) {
   char *key = NULL;
+  /* the constants it assigns */
+  for (size_t i = 0; i < st->body.size; i++) {
+    pm_node_t *s = st->body.nodes[i];
+    if (PM_NODE_TYPE(s) == PM_CONSTANT_WRITE_NODE) {
+      pm_constant_write_node_t *w = (pm_constant_write_node_t *)s;
+      mx_add_cval(path, mx_name(w->name), w->value);
+    }
+  }
   for (size_t i = 0; i < st->body.size; i++) {
     pm_node_t *s = st->body.nodes[i];
     if (PM_NODE_TYPE(s) != PM_DEF_NODE) continue;
@@ -3493,7 +3560,7 @@ static char *sp_expand_class_macros(const char *source) {
   const pm_parser_t *sv = g_parser;
   g_parser = &parser;
   if (parser.error_list.size == 0) {
-    g_mx_nmacros = 0;
+    g_mx_nmacros = 0; g_mx_ncvals = 0;
     pm_visit_node(root, mx_collect_visit, NULL);
     pm_visit_node(root, mx_const_collect_visit, NULL);
     mx_index_macros();
@@ -3637,6 +3704,8 @@ static char *sp_expand_class_macros(const char *source) {
     mx_names_free(&g_mx_dup);
     mx_names_free(&g_mx_hidden);
     g_mx_hide_all = 0; g_mx_selfname = 0;
+    for (int i = 0; i < g_mx_ncvals; i++) { free(g_mx_cvals[i].path); free(g_mx_cvals[i].name); }
+    g_mx_ncvals = 0;
     mx_names_free(&g_mx_poison);
     g_mx_poison_all = 0;
     mx_names_free(&g_mx_fixwriters);
