@@ -47,10 +47,11 @@
 typedef enum { MV_UNDEF = 0, MV_NIL, MV_TRUE, MV_FALSE, MV_INT, MV_STR, MV_SYM, MV_ARR,
   MV_SET,   /* a Set built from an Array: only asked include? */
   MV_OPQ,   /* a value only passed along (caller_locations(1, 1).first): never in text */
-  MV_OWN    /* the class the macro expands in (a value handed to a helper) */
+  MV_OWN,   /* the class the macro expands in (a value handed to a helper) */
+  MV_BLK    /* a block literal handed to the macro (`&blk`): its body, emitted where `class_eval(&blk)` runs */
 } MvKind;
 
-typedef struct Mv { MvKind k; long long i; char *s; struct Mv *a; int n; } Mv;
+typedef struct Mv { MvKind k; long long i; char *s; struct Mv *a; int n; const void *p; } Mv;
 
 typedef struct { char *name; Mv v; } MxVar;
 
@@ -98,6 +99,7 @@ typedef struct {
   int own_class;          /* the macro is a `def self.m` of the class it expands in */
   const char *clspath;    /* the name of the class it expands in, when `class X` spells it for certain */
   int in_sf;              /* running a module's `def self.m` (a helper): `self` is not the class */
+  const pm_node_t *blk;   /* the block literal of the call being run */
 } MxCtx;
 
 static Mv mv_nil(void) { Mv v; memset(&v, 0, sizeof v); v.k = MV_NIL; return v; }
@@ -266,7 +268,7 @@ static int mv_inspect_exact(Mv v) {
 static int mv_eq(Mv a, Mv b) {
   if (a.k != b.k) return 0;
   switch (a.k) {
-  case MV_SET: case MV_OPQ: case MV_OWN: return 0;
+  case MV_SET: case MV_OPQ: case MV_OWN: case MV_BLK: return 0;
   case MV_INT: return a.i == b.i;
   case MV_STR: case MV_SYM: return strcmp(a.s, b.s) == 0;
   case MV_ARR:
@@ -425,7 +427,7 @@ static void mx_forget(MxVar *iv, int niv, int *unsure) {
 static int mv_same(Mv a, Mv b) {
   if (a.k != b.k || a.k == MV_UNDEF) return 0;
   switch (a.k) {
-  case MV_SET: case MV_OPQ: case MV_OWN: return 0;
+  case MV_SET: case MV_OPQ: case MV_OWN: case MV_BLK: return 0;
   case MV_INT: return a.i == b.i;
   case MV_STR: case MV_SYM: return strcmp(a.s, b.s) == 0;
   case MV_ARR:
@@ -529,6 +531,8 @@ static int mx_exec_stmts(MxCtx *c, pm_statements_node_t *s);
 static int mx_residual(MxCtx *c, pm_node_t *n, MxBuf *b);
 
 static int mx_call_macro(MxCtx *c, MxMacro *m, pm_arguments_node_t *args, Mv *ret);
+static const pm_node_t *g_mx_blk;
+static int mx_emit_block(MxCtx *c, Mv blk, const char *target);
 static int mx_template_writes(const char *code);
 static int mx_node_writes_ivar(const pm_node_t *n);
 static void mx_poison_writes_in(const pm_node_t *body);
@@ -1467,6 +1471,25 @@ static int mx_is_raise(pm_node_t *n) {
 /* A write the evaluator cannot follow may have changed any ivar: every known
    one is unknown now, and so is every one not seen yet. */
 
+/* a block literal's body as the text of module `target`'s body */
+static int mx_emit_block(MxCtx *c, Mv blk, const char *target) {
+  const pm_block_node_t *b = (const pm_block_node_t *)blk.p;
+  if (!b || !c->out || b->parameters) return 0;
+  const char *here = c->clspath;
+  if (!here || !target) return 0;
+  size_t hl = strlen(here);
+  int same = strcmp(here, target) == 0;
+  if (!same) {
+    if (strncmp(target, here, hl) == 0 && target[hl] == ':' && target[hl + 1] == ':' && !strstr(target + hl + 2, "::")) {
+      mxb_puts(c->out, "module "); mxb_puts(c->out, target + hl + 2); mxb_puts(c->out, "\n");
+    } else { mxb_puts(c->out, "module ::"); mxb_puts(c->out, target); mxb_puts(c->out, "\n"); }
+  }
+  if (b->body) { mxb_putn(c->out, (const char *)b->body->location.start, (size_t)(b->body->location.end - b->body->location.start)); }
+  mxb_puts(c->out, "\n");
+  if (!same) mxb_puts(c->out, "end\n");
+  return 1;
+}
+
 static int mx_exec(MxCtx *c, pm_node_t *n) {
   if (c->returned || c->stopped) return 1;
   MxBuf *o = c->out;
@@ -1530,7 +1553,7 @@ static int mx_exec(MxCtx *c, pm_node_t *n) {
     if (!c->iv || mx_poisoned(nm) || !mx_eval(c, w->value, &v)) { free(nm); return 0; }
     mx_set(c->iv, c->niv, 64, nm, v);
     if (!mx_lookup(c->iv, *c->niv, nm)) { free(nm); return 0; }    /* the table was full */
-    if (o) { mxb_puts(o, nm); mxb_puts(o, " = "); mv_inspect(v, o); mxb_puts(o, "\n"); }
+    if (o && v.k != MV_BLK && v.k != MV_OWN) { mxb_puts(o, nm); mxb_puts(o, " = "); mv_inspect(v, o); mxb_puts(o, "\n"); }
     free(nm);
     c->ret = v;
     return 1;
@@ -1611,7 +1634,21 @@ static int mx_exec(MxCtx *c, pm_node_t *n) {
       free(text);
       if (tp) sf = mx_sf_find(tp, name);
     }
-    if (sf) {
+    if ((recv_own || (self_recv && c->clspath)) && !sf && (strcmp(name, "module_eval") == 0 || strcmp(name, "class_eval") == 0) &&
+        argc == 0 && cn->block && PM_NODE_TYPE(cn->block) == PM_BLOCK_ARGUMENT_NODE && mx_prim_builtin(name)) {
+      /* `class_eval(&blk)`, `mod.module_eval(&blk)`: the block's body, in that module's body */
+      Mv bv;
+      const char *target = c->clspath;
+      if (recv_own) {
+        char *rn = mx_name(((pm_local_variable_read_node_t *)cn->receiver)->name);
+        target = mx_lookup(c->loc, c->nloc, rn)->s; free(rn);
+      }
+      pm_node_t *ex = ((pm_block_argument_node_t *)cn->block)->expression;
+      if (ex && mx_eval(c, ex, &bv) && bv.k == MV_BLK) ok = mx_emit_block(c, bv, target);
+      else if (ex && mx_eval(c, ex, &bv) && bv.k == MV_NIL) ok = 1;
+      if (ok) c->ret = mv_nil();
+    }
+    else if (sf) {
       /* `Const.helper(args)`: the helper runs here, the class a value */
       Mv r;
       ok = c->depth < 16 && mx_call_macro(c, sf, cn->arguments, &r);
@@ -1807,7 +1844,7 @@ static int mx_bind_params(MxCtx *c, MxCtx *sub, MxMacro *m, pm_arguments_node_t 
       return !strict;
   pm_parameters_node_t *ps = m->def->parameters;
   size_t nreq = ps ? ps->requireds.size : 0, nopt = ps ? ps->optionals.size : 0;
-  if (ps && (ps->rest || ps->posts.size || ps->keyword_rest || ps->block)) return !strict;
+  if (ps && (ps->rest || ps->posts.size || ps->keyword_rest || (ps->block && !ps->block->name))) return !strict;
   if (argc < nreq || argc > nreq + nopt) return !strict;
   size_t ai = 0;
   for (size_t i = 0; i < nreq; i++, ai++) {
@@ -1874,6 +1911,12 @@ static int mx_bind_params(MxCtx *c, MxCtx *sub, MxMacro *m, pm_arguments_node_t 
     mx_set(sub->loc, &sub->nloc, 64, kn, v);
     free(kn);
   }
+  if (ps && ps->block) {
+    Mv bv = mv_nil();
+    if (sub->blk) { bv.k = MV_BLK; bv.p = sub->blk; }
+    char *bn = mx_name(ps->block->name);
+    mx_set(sub->loc, &sub->nloc, 64, bn, bv); free(bn);
+  }
   return 1;
 }
 
@@ -1885,6 +1928,7 @@ static int mx_call_macro(MxCtx *c, MxMacro *m, pm_arguments_node_t *argn, Mv *re
   sub.modname = m->module; sub.own_class = m->self_def == 1; sub.clspath = c->clspath;
   sub.in_sf = m->self_def == 2;
   sub.mbody = m->def->body;
+  sub.blk = g_mx_blk; g_mx_blk = NULL;
   if (!mx_bind_params(c, &sub, m, argn, 1)) return 0;
   sub.ret = mv_nil();
   pm_node_t *body = m->def->body;
@@ -1937,10 +1981,24 @@ static bool mx_dyn_visit(const pm_node_t *n, void *data) {
   return !d->found;
 }
 
+typedef struct { pm_constant_id_t name; int used; } MxBlkUse;
+static bool mx_blk_use_visit(const pm_node_t *n, void *data) {
+  MxBlkUse *u = data;
+  if (PM_NODE_TYPE(n) == PM_LOCAL_VARIABLE_READ_NODE && ((const pm_local_variable_read_node_t *)n)->name == u->name) u->used = 1;
+  return !u->used;
+}
+
 static int mx_macro_dynamic(MxMacro *m, int depth) {
   if (m->dynamic >= 0) return m->dynamic;
   if (depth > 8) return 0;
   MxDyn d = { m->module, 0, depth };
+  if (m->def->parameters && m->def->parameters->block && m->def->parameters->block->name && m->def->body) {
+    /* a block parameter the body reads (`class_eval(&blk)`) is a block the macro consumes;
+       one it only declares (`def call(name, &b)`) is not */
+    MxBlkUse u = { m->def->parameters->block->name, 0 };
+    pm_visit_node(m->def->body, mx_blk_use_visit, &u);
+    if (u.used) d.found = 1;
+  }
   if (m->def->body) pm_visit_node(m->def->body, mx_dyn_visit, &d);
   if (depth == 0) m->dynamic = d.found;
   return d.found;
@@ -3287,7 +3345,17 @@ static void mx_class_body(pm_statements_node_t *st, MxEdits *ed, MxClass *k, int
     }
     if (PM_NODE_TYPE(s) != PM_CALL_NODE) continue;
     pm_call_node_t *cn = (pm_call_node_t *)s;
-    if (cn->receiver || cn->block) continue;
+    int blkcall = 0;
+    if (cn->receiver) continue;
+    if (cn->block) {
+      /* a call with a block literal goes to a macro that takes the block (`&blk`) */
+      if (PM_NODE_TYPE(cn->block) != PM_BLOCK_NODE) continue;
+      char *bnm = mx_name(cn->name);
+      MxMacro *bm = mx_class_macro(bnm);
+      free(bnm);
+      if (!bm || !bm->def->parameters || !bm->def->parameters->block || !top || guard) continue;
+      blkcall = 1;
+    }
     if (mark) { mx_track(s); continue; }
     char *name = mx_name(cn->name);
     if (mx_bare_visibility(name) && !cn->arguments) { k->vis = 1; free(name); continue; }
@@ -3340,7 +3408,9 @@ static void mx_class_body(pm_statements_node_t *st, MxEdits *ed, MxClass *k, int
     memcpy(save, k->iv, sizeof(MxVar) * (size_t)nsave);
     Mv r;
     g_mx_full = 0;
+    g_mx_blk = blkcall ? cn->block : NULL;
     int ok = mx_call_macro(&c, m, cn->arguments, &r) && !g_mx_full;
+    g_mx_blk = NULL;
     if (!ok) {
       /* what it would have done at run time is not known here */
       if (getenv("SPINEL_MACRO_DEBUG"))
