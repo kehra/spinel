@@ -2185,6 +2185,9 @@ static bool mx_attr_dyn_visit(const pm_node_t *n, void *data) {
 /* The `def self.m`s of a class or module body that define accessors or
    methods by names their arguments give: macros of the class itself, for the
    calls of its body. */
+#define MX_MAXHOOKS 256
+static struct { char *path; pm_def_node_t *def; } g_mx_hooks[MX_MAXHOOKS];   /* `def self.included(base)`s, by module path */
+static int g_mx_nhooks;
 static void mx_collect_self_defs(pm_statements_node_t *st, const char *path) {
   char *key = NULL;
   /* the constants it assigns, and its helper methods */
@@ -2213,6 +2216,9 @@ static void mx_collect_self_defs(pm_statements_node_t *st, const char *path) {
     if (PM_NODE_TYPE(s) != PM_DEF_NODE) continue;
     pm_def_node_t *d = (pm_def_node_t *)s;
     if (!d->receiver || PM_NODE_TYPE(d->receiver) != PM_SELF_NODE || !d->body) continue;
+    { char *hn = mx_name(d->name);
+      if (strcmp(hn, "included") == 0 && g_mx_nhooks < MX_MAXHOOKS) { g_mx_hooks[g_mx_nhooks].path = strdup(path); g_mx_hooks[g_mx_nhooks++].def = d; }
+      free(hn); }
     int found = 0;
     pm_visit_node(d->body, mx_attr_dyn_visit, &found);
     if (!found) continue;
@@ -3257,6 +3263,44 @@ static int mx_run_extended(const char *xp, const char *base_own) {
    `def self.m` its body gave before the call, or a method of a module it
    extended, in the class itself or in a superclass. An ancestor whose body
    left a call that may define methods stops the walk (#8757). */
+static const char *mx_resolve_const(const char *from, const char *text);
+/* `def self.included(base)` of module `mp`: its `base.extend(X)` statements
+   (X a constant, resolved from `mp`) extend the class `k` that includes it */
+static void mx_hook_extends(MxClass *k, const char *mp) {
+  for (int i = 0; i < g_mx_nhooks; i++) {
+    if (strcmp(g_mx_hooks[i].path, mp) != 0) continue;
+    pm_def_node_t *d = g_mx_hooks[i].def;
+    if (!d->body || PM_NODE_TYPE(d->body) != PM_STATEMENTS_NODE || !d->parameters ||
+        d->parameters->requireds.size != 1 || PM_NODE_TYPE(d->parameters->requireds.nodes[0]) != PM_REQUIRED_PARAMETER_NODE) continue;
+    char *base = mx_name(((pm_required_parameter_node_t *)d->parameters->requireds.nodes[0])->name);
+    pm_statements_node_t *st = (pm_statements_node_t *)d->body;
+    for (size_t q = 0; q < st->body.size; q++) {
+      pm_node_t *sn = st->body.nodes[q];
+      if (PM_NODE_TYPE(sn) != PM_CALL_NODE) continue;
+      pm_call_node_t *c = (pm_call_node_t *)sn;
+      if (!c->receiver || PM_NODE_TYPE(c->receiver) != PM_LOCAL_VARIABLE_READ_NODE || c->block || !c->arguments) continue;
+      char *rn = mx_name(((pm_local_variable_read_node_t *)c->receiver)->name);
+      char *cm = mx_name(c->name);
+      int ok = strcmp(rn, base) == 0 && strcmp(cm, "extend") == 0;
+      free(rn); free(cm);
+      if (!ok) continue;
+      for (size_t j = 0; j < c->arguments->arguments.size; j++) {
+        pm_node_t *a = c->arguments->arguments.nodes[j];
+        if (PM_NODE_TYPE(a) != PM_CONSTANT_READ_NODE && PM_NODE_TYPE(a) != PM_CONSTANT_PATH_NODE) continue;
+        char *text = strndup((const char *)a->location.start, (size_t)(a->location.end - a->location.start));
+        const char *xp = mx_resolve_const(mp, text);
+        free(text);
+        int dup = 0;
+        for (int z = 0; xp && z < k->next; z++) if (strcmp(k->ext[z], xp) == 0) dup = 1;
+        if (xp && !dup) {
+          k->ext = realloc(k->ext, sizeof(char *) * (size_t)(k->next + 1));
+          k->ext[k->next++] = xp;
+        }
+      }
+    }
+    free(base);
+  }
+}
 static int mx_class_reaches(MxClass *k, const MxMacro *m, const char *name) {
   int depth = 0;
   for (MxClass *a = k; a && depth < 32; a = mx_class_find(a->super), depth++) {
@@ -3533,6 +3577,18 @@ static void mx_class_body(pm_statements_node_t *st, MxEdits *ed, MxClass *k, int
     if (mark) { mx_track(s); continue; }
     char *name = mx_name(cn->name);
     if (mx_bare_visibility(name) && !cn->arguments) { k->vis = 1; free(name); continue; }
+    if (strcmp(name, "include") == 0 && cn->arguments && top && !guard) {
+      /* `include M` runs M's `def self.included(base)`; the `base.extend(X)`
+         statements of it extend this class with X, as a statement of the body would */
+      for (size_t j = 0; j < cn->arguments->arguments.size; j++) {
+        pm_node_t *a = cn->arguments->arguments.nodes[j];
+        if (PM_NODE_TYPE(a) != PM_CONSTANT_READ_NODE && PM_NODE_TYPE(a) != PM_CONSTANT_PATH_NODE) continue;
+        char *text = strndup((const char *)a->location.start, (size_t)(a->location.end - a->location.start));
+        const char *mp = mx_resolve_const(k->path, text);
+        free(text);
+        if (mp) mx_hook_extends(k, mp);
+      }
+    }
     if (strcmp(name, "extend") == 0 && cn->arguments) {
       /* the modules it names, by path, when it is a statement of the body */
       for (size_t j = 0; top && !guard && j < cn->arguments->arguments.size; j++) {
@@ -4046,6 +4102,8 @@ static char *sp_expand_class_macros(const char *source) {
     mx_names_free(&g_mx_dup);
     mx_names_free(&g_mx_hidden);
     g_mx_hide_all = 0; g_mx_selfname = 0;
+    for (int i = 0; i < g_mx_nhooks; i++) free(g_mx_hooks[i].path);
+    g_mx_nhooks = 0;
     for (int i = 0; i < g_mx_ncvals; i++) { free(g_mx_cvals[i].path); free(g_mx_cvals[i].name); }
     g_mx_ncvals = 0;
     for (int i = 0; i < g_mx_nsf; i++) { free(g_mx_sf[i].module); free(g_mx_sf[i].name); }
