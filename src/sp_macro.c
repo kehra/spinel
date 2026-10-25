@@ -1295,6 +1295,40 @@ static int mx_exec(MxCtx *c, pm_node_t *n) {
     c->returned = 1;
     return 1;
   }
+  case PM_LOCAL_VARIABLE_OR_WRITE_NODE: {
+    /* `x ||= v`: v only when x is nil or false */
+    pm_local_variable_or_write_node_t *w = (pm_local_variable_or_write_node_t *)n;
+    char *nm = mx_name(w->name);
+    Mv *cur = mx_lookup(c->loc, c->nloc, nm);
+    if (cur && cur->k != MV_UNDEF && mv_truthy(*cur)) { c->ret = *cur; free(nm); return 1; }
+    if (!cur || cur->k == MV_UNDEF) { free(nm); return 0; }
+    Mv v;
+    if (!mx_eval(c, w->value, &v)) { free(nm); return 0; }
+    mx_set(c->loc, &c->nloc, 64, nm, v);
+    free(nm);
+    c->ret = v;
+    return 1;
+  }
+  case PM_MULTI_WRITE_NODE: {
+    /* `a, b = x, y` over plain locals */
+    pm_multi_write_node_t *w = (pm_multi_write_node_t *)n;
+    if (w->rest || w->rights.size || !w->value || PM_NODE_TYPE(w->value) != PM_ARRAY_NODE) return 0;
+    pm_array_node_t *arr = (pm_array_node_t *)w->value;
+    if (arr->elements.size != w->lefts.size) return 0;
+    Mv vals[16];
+    if (w->lefts.size > 16) return 0;
+    for (size_t i = 0; i < w->lefts.size; i++) {
+      if (PM_NODE_TYPE(w->lefts.nodes[i]) != PM_LOCAL_VARIABLE_TARGET_NODE) return 0;
+      if (PM_NODE_TYPE(arr->elements.nodes[i]) == PM_SPLAT_NODE || !mx_eval(c, arr->elements.nodes[i], &vals[i])) return 0;
+    }
+    for (size_t i = 0; i < w->lefts.size; i++) {
+      char *nm = mx_name(((pm_local_variable_target_node_t *)w->lefts.nodes[i])->name);
+      mx_set(c->loc, &c->nloc, 64, nm, vals[i]);
+      free(nm);
+    }
+    c->ret = mv_undef();
+    return 1;
+  }
   case PM_LOCAL_VARIABLE_WRITE_NODE: {
     pm_local_variable_write_node_t *w = (pm_local_variable_write_node_t *)n;
     Mv v;
