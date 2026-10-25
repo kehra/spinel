@@ -514,6 +514,7 @@ static int mx_attr_dyn(const pm_call_node_t *cn, int strict) {
 }
 
 static int mx_eval(MxCtx *c, pm_node_t *n, Mv *out);
+static int g_mx_debug2, g_mx_failed;   /* SPINEL_MACRO_DEBUG=2: the first statement a macro stopped at */
 
 static int mx_exec_stmts(MxCtx *c, pm_statements_node_t *s);
 
@@ -802,7 +803,16 @@ done:
   return ok;
 }
 
+static int mx_eval_in(MxCtx *c, pm_node_t *n, Mv *out);
 static int mx_eval(MxCtx *c, pm_node_t *n, Mv *out) {
+  int r = mx_eval_in(c, n, out);
+  if (!r && g_mx_debug2 && !g_mx_failed) {
+    g_mx_failed = 1;
+    fprintf(stderr, "macro cannot evaluate: %.*s\n", (int)(n->location.end - n->location.start > 100 ? 100 : n->location.end - n->location.start), (const char *)n->location.start);
+  }
+  return r;
+}
+static int mx_eval_in(MxCtx *c, pm_node_t *n, Mv *out) {
   if (!n) { *out = mv_nil(); return 1; }
   switch (PM_NODE_TYPE(n)) {
   case PM_NIL_NODE: *out = mv_nil(); return 1;
@@ -1241,7 +1251,16 @@ static int mx_is_raise(pm_node_t *n) {
 /* A write the evaluator cannot follow may have changed any ivar: every known
    one is unknown now, and so is every one not seen yet. */
 
+static int mx_exec_in(MxCtx *c, pm_node_t *n);
 static int mx_exec(MxCtx *c, pm_node_t *n) {
+  int r = mx_exec_in(c, n);
+  if (!r && g_mx_debug2 && !g_mx_failed) {
+    g_mx_failed = 1;
+    fprintf(stderr, "macro stopped at: %.*s\n", (int)(n->location.end - n->location.start > 100 ? 100 : n->location.end - n->location.start), (const char *)n->location.start);
+  }
+  return r;
+}
+static int mx_exec_in(MxCtx *c, pm_node_t *n) {
   if (c->returned || c->stopped) return 1;
   MxBuf *o = c->out;
   switch (PM_NODE_TYPE(n)) {
@@ -3017,7 +3036,7 @@ static void mx_class_body(pm_statements_node_t *st, MxEdits *ed, MxClass *k, int
     MxVar save[64]; int nsave = k->niv;
     memcpy(save, k->iv, sizeof(MxVar) * (size_t)nsave);
     Mv r;
-    g_mx_full = 0;
+    g_mx_full = 0; g_mx_failed = 0; g_mx_debug2 = getenv("SPINEL_MACRO_DEBUG") && getenv("SPINEL_MACRO_DEBUG")[0] == '2';
     int ok = mx_call_macro(&c, m, cn->arguments, &r) && !g_mx_full;
     if (!ok) {
       /* what it would have done at run time is not known here */
@@ -3042,7 +3061,7 @@ static void mx_class_body(pm_statements_node_t *st, MxEdits *ed, MxClass *k, int
     char *body = mx_join_residual(out.p ? out.p : "");
     if (!body) {
       if (getenv("SPINEL_MACRO_DEBUG"))
-        fprintf(stderr, "macro residual not joinable: %.*s\n", (int)(s->location.end - s->location.start), (const char *)s->location.start);
+        fprintf(stderr, "macro residual not joinable: %.*s => [%s]\n", (int)(s->location.end - s->location.start), (const char *)s->location.start, out.p ? out.p : "");
       memcpy(k->iv, save, sizeof(MxVar) * (size_t)nsave); k->niv = nsave;
       k->unknown = 1;
       free(rep.p); free(out.p); continue;
