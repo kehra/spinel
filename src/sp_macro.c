@@ -703,6 +703,22 @@ static int mx_eval_call(MxCtx *c, pm_call_node_t *n, Mv *out) {
     for (int i = 0; i < r.n; i++) if (mv_eq(r.a[i], a)) has = 1;
     *out = mv_nil(); out->k = has ? MV_TRUE : MV_FALSE; ok = 1; goto done;
   }
+  /* `x.is_a?(Module)` for the values the evaluator holds */
+  if (argc == 1 && strcmp(name, "is_a?") == 0 && mx_prim_builtin(name) &&
+      (PM_NODE_TYPE(args->nodes[0]) == PM_CONSTANT_READ_NODE)) {
+    char *cn = mx_name(((pm_constant_read_node_t *)args->nodes[0])->name);
+    int known = 1, yes = 0;
+    if (strcmp(cn, "Symbol") == 0) yes = r.k == MV_SYM;
+    else if (strcmp(cn, "String") == 0) yes = r.k == MV_STR;
+    else if (strcmp(cn, "Integer") == 0) yes = r.k == MV_INT;
+    else if (strcmp(cn, "Array") == 0) yes = r.k == MV_ARR;
+    else if (strcmp(cn, "NilClass") == 0) yes = r.k == MV_NIL;
+    else if (strcmp(cn, "Module") == 0 || strcmp(cn, "Class") == 0) yes = 0;
+    else known = 0;
+    free(cn);
+    if (known) { *out = mv_nil(); out->k = yes ? MV_TRUE : MV_FALSE; ok = 1; }
+    goto done;
+  }
   if (argc == 2 && (strcmp(name, "gsub") == 0 || strcmp(name, "sub") == 0) && r.k == MV_STR && mx_ascii(r.s)) {
     MxPat pt; Mv rep;
     /* a replacement with a backslash names a group: not followed */
