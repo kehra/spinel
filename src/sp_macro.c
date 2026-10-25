@@ -651,6 +651,78 @@ static size_t mx_pat_at(const MxPat *pt, const char *s) {
   return n;
 }
 
+/* a literal regex over ASCII, matched against s: literals, `.`, classes, `^ $ \A \z`,
+   `*` `+` `?` after a single item. 1 match, 0 none, -1 not followed. */
+static int mx_re_item(const char **pp, const char *e, MxPat *cls, int *kind, unsigned char *ch) {
+  const char *p = *pp;
+  *kind = 0;
+  if (*p == '[') {
+    const char *r = p + 1; int first = 1;
+    if (r < e && *r == '^') r++;
+    while (r < e && (*r != ']' || first)) { if (*r == '\\') r++; r++; first = 0; }
+    if (r >= e) return -1;
+    if (mx_pat_class(p + 1, e, cls) < 0) return -1;
+    *kind = 1; *pp = r + 1; return 0;
+  }
+  if (*p == '\\') {
+    if (p + 1 >= e) return -1;
+    if (isalnum((unsigned char)p[1])) return -1;
+    *ch = (unsigned char)p[1]; *kind = 2; *pp = p + 2; return 0;
+  }
+  if (strchr("()|{}*+?", *p)) return -1;
+  if (*p == '.') { *kind = 3; *pp = p + 1; return 0; }
+  if ((unsigned char)*p >= 0x80) return -1;
+  *ch = (unsigned char)*p; *kind = 2; *pp = p + 1; return 0;
+}
+static int mx_re_here(const char *p, const char *e, const char *s, const char *s0) {
+  while (p < e) {
+    if (*p == '$') { if (p + 1 != e) return -1; return (*s == 0 || *s == '\n') ? 1 : 0; }
+    if (p[0] == '\\' && p + 1 < e && (p[1] == 'z' || p[1] == 'Z' || p[1] == 'A')) {
+      if (p[1] == 'z') { if (*s) return 0; }
+      else if (p[1] == 'Z') { if (!(*s == 0 || (*s == '\n' && !s[1]))) return 0; }
+      else if (s != s0) return 0;
+      p += 2; continue;
+    }
+    MxPat cls; int kind; unsigned char ch = 0;
+    const char *q = p;
+    if (mx_re_item(&q, e, &cls, &kind, &ch) < 0) return -1;
+    int lo = 1, hi = 1;
+    if (q < e && (*q == '*' || *q == '+' || *q == '?')) { lo = *q == '+' ? 1 : 0; hi = *q == '?' ? 1 : 1 << 20; q++; }
+    int n = 0;
+    while (n < hi && *s && ((kind == 1 && cls.set[(unsigned char)*s]) || (kind == 2 && (unsigned char)*s == ch) || (kind == 3 && *s != '\n'))) { n++; s++; }
+    if (n < lo) return 0;
+    /* backtrack over the run */
+    for (; n >= lo; n--, s--) {
+      int r = mx_re_here(q, e, s, s0);
+      if (r != 0) return r;
+      if (n == lo) break;
+    }
+    return 0;
+  }
+  return 1;
+}
+static int mx_re_match(pm_node_t *re, const char *subject) {
+  pm_regular_expression_node_t *r = (pm_regular_expression_node_t *)re;
+  if (re->flags & (PM_REGULAR_EXPRESSION_FLAGS_IGNORE_CASE | PM_REGULAR_EXPRESSION_FLAGS_EXTENDED |
+                   PM_REGULAR_EXPRESSION_FLAGS_MULTI_LINE | PM_REGULAR_EXPRESSION_FLAGS_ONCE)) return -1;
+  if (!mx_ascii(subject)) return -1;
+  const char *p = (const char *)r->content_loc.start, *e = (const char *)r->content_loc.end;
+  int anchored = 0;
+  if (p < e && *p == '^') { anchored = 2; p++; }
+  else if (p + 1 < e && p[0] == '\\' && p[1] == 'A') { anchored = 1; }
+  for (const char *s = subject; ; s++) {
+    if (anchored != 1 || s == subject) {
+      if (!(anchored == 2 && s != subject && s[-1] != '\n')) {
+        int m = mx_re_here(p, e, s, subject);
+        if (m != 0) return m;
+      }
+    }
+    if (!*s) break;
+  }
+  return 0;
+}
+
+
 static int mx_eval_call(MxCtx *c, pm_call_node_t *n, Mv *out) {
   char *name = mx_name(n->name);
   int ok = 0;
@@ -677,6 +749,16 @@ static int mx_eval_call(MxCtx *c, pm_call_node_t *n, Mv *out) {
     else if (!m && c->clspath && !argc && (strcmp(name, "name") == 0 || strcmp(name, "to_s") == 0 ||
                                            strcmp(name, "inspect") == 0) && mx_prim_builtin(name) && !g_mx_selfname) {
       *out = mv_str(c->clspath, strlen(c->clspath), MV_STR); ok = 1;
+    }
+    goto done;
+  }
+  if (!n->receiver) goto done;
+  /* a literal regex tested against a String: `/\\A\\d/.match?(s)` */
+  if (PM_NODE_TYPE(n->receiver) == PM_REGULAR_EXPRESSION_NODE && argc == 1 && strcmp(name, "match?") == 0) {
+    Mv subj;
+    if (mx_eval(c, args->nodes[0], &subj) && (subj.k == MV_STR || subj.k == MV_SYM)) {
+      int m = mx_re_match(n->receiver, subj.s);
+      if (m >= 0) { *out = mv_nil(); out->k = m ? MV_TRUE : MV_FALSE; ok = 1; }
     }
     goto done;
   }
