@@ -909,8 +909,22 @@ static int mx_eval(MxCtx *c, pm_node_t *n, Mv *out) {
       arm = ((pm_else_node_t *)e)->statements;
     }
     if (!arm) { *out = mv_nil(); return 1; }
-    if (arm->body.size != 1) return 0;
-    return mx_eval(c, arm->body.nodes[0], out);
+    /* a longer arm: its statements in turn (local writes land in the macro's locals) */
+    for (size_t i = 0; i < arm->body.size; i++)
+      if (!mx_eval(c, arm->body.nodes[i], out)) return 0;
+    return 1;
+  }
+  case PM_LOCAL_VARIABLE_WRITE_NODE: {
+    pm_local_variable_write_node_t *w = (pm_local_variable_write_node_t *)n;
+    Mv v;
+    if (!mx_eval(c, w->value, &v)) return 0;
+    char *nm = mx_name(w->name);
+    /* an Array this local alone holds (`l = []`) may be appended to in place */
+    if (v.k == MV_ARR) v.i = PM_NODE_TYPE(w->value) == PM_ARRAY_NODE;
+    mx_set(c->loc, &c->nloc, 64, nm, v);
+    free(nm);
+    *out = v;
+    return 1;
   }
   default: return 0;
   }
