@@ -44,7 +44,9 @@
  * The macro's ivars are not followed: a macro that reads or writes one is not
  * evaluated, and its call stays as written. So does anything else the
  * evaluator does not understand. A replacement keeps the call's line count. */
-typedef enum { MV_UNDEF = 0, MV_NIL, MV_TRUE, MV_FALSE, MV_INT, MV_STR, MV_SYM, MV_ARR } MvKind;
+typedef enum { MV_UNDEF = 0, MV_NIL, MV_TRUE, MV_FALSE, MV_INT, MV_STR, MV_SYM, MV_ARR,
+  MV_SET    /* a Set built from an Array: only asked include? */
+} MvKind;
 
 typedef struct Mv { MvKind k; long long i; char *s; struct Mv *a; int n; } Mv;
 
@@ -261,6 +263,7 @@ static int mv_inspect_exact(Mv v) {
 static int mv_eq(Mv a, Mv b) {
   if (a.k != b.k) return 0;
   switch (a.k) {
+  case MV_SET: return 0;
   case MV_INT: return a.i == b.i;
   case MV_STR: case MV_SYM: return strcmp(a.s, b.s) == 0;
   case MV_ARR:
@@ -419,6 +422,7 @@ static void mx_forget(MxVar *iv, int niv, int *unsure) {
 static int mv_same(Mv a, Mv b) {
   if (a.k != b.k || a.k == MV_UNDEF) return 0;
   switch (a.k) {
+  case MV_SET: return 0;
   case MV_INT: return a.i == b.i;
   case MV_STR: case MV_SYM: return strcmp(a.s, b.s) == 0;
   case MV_ARR:
@@ -548,6 +552,7 @@ static int mx_eval_parts(MxCtx *c, pm_node_list_t *parts, MxBuf *b) {
       if (!e->statements || e->statements->body.size != 1) return 0;
       Mv v;
       if (!mx_eval(c, e->statements->body.nodes[0], &v)) return 0;
+      if (v.k >= MV_SET) return 0;
       if (v.k == MV_ARR) { if (!mv_inspect_exact(v)) return 0; mv_inspect(v, b); }
       else mv_to_s(v, b);
     }
@@ -677,6 +682,27 @@ static int mx_eval_call(MxCtx *c, pm_call_node_t *n, Mv *out) {
   }
   Mv r;
   if (!mx_eval(c, n->receiver, &r)) goto done;
+  /* what a Set is asked at compile time */
+  if (r.k == MV_SET) {
+    if (argc == 1 && (strcmp(name, "include?") == 0 || strcmp(name, "member?") == 0)) {
+      Mv a; int has = 0;
+      if (!mx_eval(c, args->nodes[0], &a) || a.k >= MV_SET) goto done;
+      for (int i = 0; i < r.n; i++) if (mv_eq(r.a[i], a)) has = 1;
+      *out = mv_nil(); out->k = has ? MV_TRUE : MV_FALSE; ok = 1;
+    }
+    else if (!argc && strcmp(name, "freeze") == 0) { *out = r; ok = 1; }
+    goto done;
+  }
+  if (!argc && strcmp(name, "freeze") == 0 && (r.k == MV_ARR || r.k == MV_STR || r.k == MV_SYM)) {
+    *out = r; if (r.k == MV_ARR) out->i = 0; ok = 1; goto done;
+  }
+  if (!argc && strcmp(name, "to_set") == 0 && r.k == MV_ARR) { *out = r; out->k = MV_SET; out->i = 0; ok = 1; goto done; }
+  if (argc == 1 && strcmp(name, "include?") == 0 && r.k == MV_ARR) {
+    Mv a; int has = 0;
+    if (!mx_eval(c, args->nodes[0], &a) || a.k >= MV_SET) goto done;
+    for (int i = 0; i < r.n; i++) if (mv_eq(r.a[i], a)) has = 1;
+    *out = mv_nil(); out->k = has ? MV_TRUE : MV_FALSE; ok = 1; goto done;
+  }
   if (argc == 2 && (strcmp(name, "gsub") == 0 || strcmp(name, "sub") == 0) && r.k == MV_STR && mx_ascii(r.s)) {
     MxPat pt; Mv rep;
     /* a replacement with a backslash names a group: not followed */
@@ -1034,6 +1060,7 @@ static bool mx_subst_visit(const pm_node_t *n, void *data) {
   /* ... and a String or Array the block held is one object across calls,
      which a mutation changes; the substituted literal is a new one each time
      (and a frozen String's FrozenError the clauses' rescue would swallow) */
+  if (v.k >= MV_SET) { s->bad = 1; return false; }
   if (s->clauses && !s->interp && (v.k == MV_STR || v.k == MV_ARR)) { s->bad = 1; return false; }
   mxb_putn(s->b, (const char *)s->from, (size_t)(n->location.start - s->from));
   mxb_puts(s->b, "(");
