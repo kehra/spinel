@@ -1794,6 +1794,15 @@ static void mx_collect_module(pm_statements_node_t *st, const char *path, int ff
   }
 }
 
+/* The core classes and modules every class body is an instance of: a method
+   the program gives one of them (`class Module; def macro(...)`) is a macro
+   every class and module body can call, without an `extend`. */
+static int mx_universal_path(const char *path) {
+  static const char *const U[] = { "::Class", "::Module", "::Object", "::BasicObject", "::Kernel", NULL };
+  for (int i = 0; U[i]; i++) if (strcmp(path, U[i]) == 0) return 1;
+  return 0;
+}
+
 static int g_mx_in_ffi;   /* inside the ffi package's FFI module */
 
 /* The class and module bodies, with their lexical path: `A::B` stays `A::B`,
@@ -1815,7 +1824,7 @@ static bool mx_collect_visit(const pm_node_t *n, void *data) {
   int ffi = is_mod && ln && strcmp(ln, "FFI") == 0;
   free(ln);
   if (ffi) g_mx_in_ffi++;
-  if (is_mod && body && PM_NODE_TYPE(body) == PM_STATEMENTS_NODE)
+  if ((is_mod || mx_universal_path(full)) && body && PM_NODE_TYPE(body) == PM_STATEMENTS_NODE)
     mx_collect_module((pm_statements_node_t *)body, full, g_mx_in_ffi > 0);
   if (body && PM_NODE_TYPE(body) == PM_STATEMENTS_NODE && !g_mx_in_ffi)
     mx_collect_self_defs((pm_statements_node_t *)body, full);
@@ -2705,6 +2714,7 @@ static MxClass *mx_class_find(const char *path) {
    left a call that may define methods stops the walk (#8757). */
 static int mx_class_reaches(MxClass *k, const MxMacro *m, const char *name) {
   int depth = 0;
+  if (!m->self_def && mx_universal_path(m->module)) return 1;
   for (MxClass *a = k; a && depth < 32; a = mx_class_find(a->super), depth++) {
     if (a != k && (a->unknown || a->noiv)) return 0;
     if (m->self_def) {
@@ -3316,7 +3326,8 @@ static char *sp_expand_class_macros(const char *source) {
   /* cheap gate: a module_eval / const_set / public_send somewhere, or an
      attr_* call or a class method's define_method that names what it
      defines at run time */
-  if ((!strstr(source, "extend") ||
+  if (((!strstr(source, "extend") && !strstr(source, "class Class") && !strstr(source, "class Module") &&
+        !strstr(source, "class Object") && !strstr(source, "class BasicObject") && !strstr(source, "module Kernel")) ||
        (!strstr(source, "module_eval") && !strstr(source, "class_eval") &&
         !strstr(source, "const_set") && !strstr(source, "public_send") &&
         !strstr(source, "define_singleton_method") && !strstr(source, "define_method"))) &&
