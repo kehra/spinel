@@ -45,7 +45,8 @@
  * evaluated, and its call stays as written. So does anything else the
  * evaluator does not understand. A replacement keeps the call's line count. */
 typedef enum { MV_UNDEF = 0, MV_NIL, MV_TRUE, MV_FALSE, MV_INT, MV_STR, MV_SYM, MV_ARR,
-  MV_SET    /* a Set built from an Array: only asked include? */
+  MV_SET,   /* a Set built from an Array: only asked include? */
+  MV_OPQ    /* a value only passed along (caller_locations(1, 1).first): never in text */
 } MvKind;
 
 typedef struct Mv { MvKind k; long long i; char *s; struct Mv *a; int n; } Mv;
@@ -263,7 +264,7 @@ static int mv_inspect_exact(Mv v) {
 static int mv_eq(Mv a, Mv b) {
   if (a.k != b.k) return 0;
   switch (a.k) {
-  case MV_SET: return 0;
+  case MV_SET: case MV_OPQ: return 0;
   case MV_INT: return a.i == b.i;
   case MV_STR: case MV_SYM: return strcmp(a.s, b.s) == 0;
   case MV_ARR:
@@ -422,7 +423,7 @@ static void mx_forget(MxVar *iv, int niv, int *unsure) {
 static int mv_same(Mv a, Mv b) {
   if (a.k != b.k || a.k == MV_UNDEF) return 0;
   switch (a.k) {
-  case MV_SET: return 0;
+  case MV_SET: case MV_OPQ: return 0;
   case MV_INT: return a.i == b.i;
   case MV_STR: case MV_SYM: return strcmp(a.s, b.s) == 0;
   case MV_ARR:
@@ -790,6 +791,10 @@ static int mx_eval_call(MxCtx *c, pm_call_node_t *n, Mv *out) {
       /* it still runs at run time, from the text that keeps it */
       if (!ok && c->iv) { memcpy(c->iv, sv_iv, sizeof(MxVar) * (size_t)sv_niv); *c->niv = sv_niv; mx_forget(c->iv, sv_niv, c->unsure); }
     }
+    else if (!m && !n->receiver && strcmp(name, "caller_locations") == 0 && argc <= 2 &&
+             !mx_names_has(&g_mx_defs, name) && !mx_names_has(&g_mx_hidden, name)) {
+      *out = mv_nil(); out->k = MV_OPQ; ok = 1;
+    }
     /* the class's own name: `self.name`, `to_s`, `inspect` (Module's own) */
     else if (!m && c->clspath && !argc && (strcmp(name, "name") == 0 || strcmp(name, "to_s") == 0 ||
                                            strcmp(name, "inspect") == 0) && mx_prim_builtin(name) && !g_mx_selfname) {
@@ -809,7 +814,12 @@ static int mx_eval_call(MxCtx *c, pm_call_node_t *n, Mv *out) {
   }
   Mv r;
   if (!mx_eval(c, n->receiver, &r)) goto done;
-  /* what a Set is asked at compile time */
+  /* what a Set or a caller location is asked at compile time */
+  if (r.k == MV_OPQ) {
+    if (!argc && (strcmp(name, "first") == 0 || strcmp(name, "path") == 0 || strcmp(name, "lineno") == 0 ||
+                  strcmp(name, "label") == 0 || strcmp(name, "absolute_path") == 0)) { *out = r; ok = 1; }
+    goto done;
+  }
   if (r.k == MV_SET) {
     if (argc == 1 && (strcmp(name, "include?") == 0 || strcmp(name, "member?") == 0)) {
       Mv a; int has = 0;
