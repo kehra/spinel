@@ -1,6 +1,5 @@
-# A macro changing a local array in place is not followed: what `parts << x`
-# leaves in it is the run time's, so the macro is not expanded (its run-time
-# public_send refused), not expanded with the array before the change.
+# A macro changing a local array in place (`parts << x`) is followed: the text it builds
+# sees the array after the change, as at run time.
 module Consts
   def constant(c)
     parts = ["calc", "box"]
