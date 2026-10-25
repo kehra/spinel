@@ -1967,6 +1967,16 @@ static void mx_selfname_scan(pm_node_t *cp, pm_node_t *body) {
   free(last);
 }
 
+/* `alias_method m, m` (the same local or the same literal twice) gives the
+   method no new name: it is how code silences the redefinition warning. */
+static int mx_self_alias(const pm_call_node_t *cn, const char *nm) {
+  if (strcmp(nm, "alias_method") != 0 || !cn->arguments || cn->arguments->arguments.size != 2) return 0;
+  const pm_node_t *a = cn->arguments->arguments.nodes[0], *b = cn->arguments->arguments.nodes[1];
+  if (PM_NODE_TYPE(a) != PM_LOCAL_VARIABLE_READ_NODE || PM_NODE_TYPE(b) != PM_LOCAL_VARIABLE_READ_NODE) return 0;
+  return ((const pm_local_variable_read_node_t *)a)->name == ((const pm_local_variable_read_node_t *)b)->name &&
+         ((const pm_local_variable_read_node_t *)a)->depth == ((const pm_local_variable_read_node_t *)b)->depth;
+}
+
 static bool mx_hide_visit(const pm_node_t *n, void *data) {
   MxHideScan *hs = data;
   switch (PM_NODE_TYPE(n)) {
@@ -2032,7 +2042,7 @@ static bool mx_hide_visit(const pm_node_t *n, void *data) {
         strcmp(nm, "remove_singleton_method") == 0) {
       char *a0 = cn->arguments && cn->arguments->arguments.size ? mx_sym_or_str(cn->arguments->arguments.nodes[0]) : NULL;
       if (a0) { mx_names_add(&g_mx_hidden, a0); free(a0); }
-      else if (!hs->in_macro) g_mx_hide_all = 1;
+      else if (!hs->in_macro && !mx_self_alias(cn, nm)) g_mx_hide_all = 1;
     }
     free(nm);
     return true;
