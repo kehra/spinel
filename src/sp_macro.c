@@ -1241,6 +1241,17 @@ static int mx_is_raise(pm_node_t *n) {
 /* A write the evaluator cannot follow may have changed any ivar: every known
    one is unknown now, and so is every one not seen yet. */
 
+/* `singleton_class` of self, as a receiver */
+static int mx_is_singleton_recv(const pm_node_t *r) {
+  if (!r || PM_NODE_TYPE(r) != PM_CALL_NODE) return 0;
+  const pm_call_node_t *q = (const pm_call_node_t *)r;
+  if ((q->receiver && PM_NODE_TYPE(q->receiver) != PM_SELF_NODE) || q->arguments || q->block) return 0;
+  char *nm = mx_name(q->name);
+  int ok = strcmp(nm, "singleton_class") == 0 && mx_prim_builtin(nm);
+  free(nm);
+  return ok;
+}
+
 static int mx_exec(MxCtx *c, pm_node_t *n) {
   if (c->returned || c->stopped) return 1;
   MxBuf *o = c->out;
@@ -1334,7 +1345,7 @@ static int mx_exec(MxCtx *c, pm_node_t *n) {
       ok = c->depth < 16 && mx_call_macro(c, m, cn->arguments, &r);
       if (ok) c->ret = r;
     }
-    else if (self_recv && argc >= 1 && !cn->block &&
+    else if ((self_recv || mx_is_singleton_recv(cn->receiver)) && argc >= 1 && !cn->block &&
              /* only these evaluate a string as the class body: instance_eval
                 defines on the singleton class, and the _exec forms take a
                 block, not code */
@@ -1343,7 +1354,12 @@ static int mx_exec(MxCtx *c, pm_node_t *n) {
       Mv code;
       if (mx_eval(c, args->nodes[0], &code) && code.k == MV_STR && sp_snippet_graftable(code.s) &&
           !mx_template_writes(code.s)) {
-        if (o) { mxb_puts(o, code.s); mxb_puts(o, "\n"); }
+        /* `singleton_class.module_eval(text)` is the text in `class << self` */
+        if (o) {
+          if (!self_recv) mxb_puts(o, "class << self; ");
+          mxb_puts(o, code.s);
+          mxb_puts(o, !self_recv ? "\nend\n" : "\n");
+        }
         c->ret = mv_nil();
         ok = 1;
       }
@@ -1617,7 +1633,7 @@ static bool mx_dyn_visit(const pm_node_t *n, void *data) {
   if (PM_NODE_TYPE(n) == PM_CALL_NODE) {
     pm_call_node_t *cn = (pm_call_node_t *)n;
     char *nm = mx_name(cn->name);
-    int self_recv = !cn->receiver || PM_NODE_TYPE(cn->receiver) == PM_SELF_NODE;
+    int self_recv = !cn->receiver || PM_NODE_TYPE(cn->receiver) == PM_SELF_NODE || mx_is_singleton_recv(cn->receiver);
     if (mx_attr_dyn(cn, 1)) d->found = 1;
     if (self_recv) {
       static const char *const DYN[] = { "module_eval", "class_eval", "instance_eval",
