@@ -701,6 +701,9 @@ static int mx_eval_call(MxCtx *c, pm_call_node_t *n, Mv *out) {
     else if (strcmp(name, "to_s") == 0 && r.k != MV_ARR) {
       MxBuf b = {0}; mv_to_s(r, &b); *out = mv_str(b.p ? b.p : "", b.len, MV_STR); free(b.p); ok = 1;
     }
+    else if (strcmp(name, "empty?") == 0 && (r.k == MV_ARR || r.k == MV_STR || r.k == MV_SYM)) {
+      *out = mv_nil(); out->k = (r.k == MV_ARR ? r.n == 0 : r.s[0] == 0) ? MV_TRUE : MV_FALSE; ok = 1;
+    }
     else if (strcmp(name, "to_sym") == 0 && (r.k == MV_STR || r.k == MV_SYM)) { *out = r; out->k = MV_SYM; ok = 1; }
     else if (strcmp(name, "inspect") == 0 && mv_inspect_exact(r)) {
       MxBuf b = {0}; mv_inspect(r, &b); *out = mv_str(b.p ? b.p : "", b.len, MV_STR); free(b.p); ok = 1;
@@ -846,7 +849,10 @@ static int mx_eval(MxCtx *c, pm_node_t *n, Mv *out) {
     char *nm = mx_name(((pm_local_variable_read_node_t *)n)->name);
     Mv *v = mx_lookup(c->loc, c->nloc, nm);
     free(nm);
-    if (!v) return 0;
+    if (!v || v->k == MV_UNDEF) return 0;
+    /* a read may let the array escape (a second name, a macro's parameter):
+       it is no longer the one local's to change in place (see mx_push) */
+    if (v->k == MV_ARR) v->i = 0;
     *out = *v; return 1;
   }
   case PM_INSTANCE_VARIABLE_READ_NODE: {
@@ -1241,6 +1247,50 @@ static int mx_is_raise(pm_node_t *n) {
 /* A write the evaluator cannot follow may have changed any ivar: every known
    one is unknown now, and so is every one not seen yet. */
 
+/* `list << a << b`, `list.push(a, b)` and `list.append(a)` on a local Array
+   the macro made itself (`list = []`, and not read since: a read may have
+   given it a second name). The values are appended to the local (a new
+   array; a value that read the old one keeps what it saw). Any other change
+   made to a value in place is not followed. */
+static int mx_push(MxCtx *c, pm_call_node_t *cn) {
+  pm_call_node_t *chain[16]; int nchain = 0;
+  pm_node_t *cur = (pm_node_t *)cn;
+  while (cur && PM_NODE_TYPE(cur) == PM_CALL_NODE) {
+    pm_call_node_t *q = (pm_call_node_t *)cur;
+    char *nm = mx_name(q->name);
+    int push = (strcmp(nm, "<<") == 0 || strcmp(nm, "push") == 0 || strcmp(nm, "append") == 0) && q->receiver &&
+               !q->block && q->arguments && q->arguments->arguments.size >= 1;
+    free(nm);
+    if (!push || nchain == 16) return 0;
+    chain[nchain++] = q;
+    cur = q->receiver;
+  }
+  if (!cur || PM_NODE_TYPE(cur) != PM_LOCAL_VARIABLE_READ_NODE) return 0;
+  char *vn = mx_name(((pm_local_variable_read_node_t *)cur)->name);
+  Mv *v = mx_lookup(c->loc, c->nloc, vn);
+  if (!v || v->k != MV_ARR || v->i != 1) { free(vn); return 0; }
+  Mv add[16]; int nadd = 0;
+  for (int i = nchain - 1; i >= 0; i--) {
+    pm_node_list_t *al = &chain[i]->arguments->arguments;
+    for (size_t j = 0; j < al->size; j++) {
+      pm_node_t *a = al->nodes[j];
+      if (nadd == 16 || PM_NODE_TYPE(a) == PM_SPLAT_NODE || PM_NODE_TYPE(a) == PM_KEYWORD_HASH_NODE ||
+          !mx_eval(c, a, &add[nadd])) { free(vn); return 0; }
+      nadd++;
+    }
+  }
+  v = mx_lookup(c->loc, c->nloc, vn);   /* an argument that read the array (`l << l`) un-owned it */
+  if (!v || v->i != 1) { free(vn); return 0; }
+  Mv nv = *v;
+  nv.a = calloc((size_t)(v->n + nadd) + 1, sizeof(Mv));
+  for (int i = 0; i < v->n; i++) nv.a[i] = v->a[i];
+  for (int i = 0; i < nadd; i++) nv.a[v->n + i] = add[i];
+  nv.n = v->n + nadd; nv.i = 1;
+  *v = nv;
+  free(vn);
+  return 1;
+}
+
 static int mx_exec(MxCtx *c, pm_node_t *n) {
   if (c->returned || c->stopped) return 1;
   MxBuf *o = c->out;
@@ -1257,6 +1307,8 @@ static int mx_exec(MxCtx *c, pm_node_t *n) {
     Mv v;
     if (!mx_eval(c, w->value, &v)) return 0;
     char *nm = mx_name(w->name);
+    /* an Array this local alone holds (`l = []`) may be appended to in place */
+    if (v.k == MV_ARR) v.i = PM_NODE_TYPE(w->value) == PM_ARRAY_NODE;
     mx_set(c->loc, &c->nloc, 64, nm, v);
     free(nm);
     c->ret = v;
@@ -1329,7 +1381,11 @@ static int mx_exec(MxCtx *c, pm_node_t *n) {
     size_t argc = args ? args->size : 0;
     int ok = 0;
     MxMacro *m = self_recv ? mx_nested_macro(c->modname, name) : NULL;
-    if (m) {
+    if (!m && !self_recv && argc >= 1 && mx_push(c, cn)) {
+      c->ret = mv_undef();
+      ok = 1;
+    }
+    else if (m) {
       Mv r;
       ok = c->depth < 16 && mx_call_macro(c, m, cn->arguments, &r);
       if (ok) c->ret = r;

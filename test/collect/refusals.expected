@@ -946,10 +946,6 @@ spinel: 1 refusal, nothing written
 == test/reject/macro_lambda_assign.rb [promote] rc=1
 spinel: test/reject/macro_lambda_assign.rb:11: undefined method 'k' for a Class: no class in the program defines a class method 'k' (NoMethodError)
 spinel: 1 refusal, nothing written
-== test/reject/macro_local_mutated.rb [default] rc=1
-spinel: test/reject/macro_local_mutated.rb:8: unsupported send with a runtime method name (AOT needs a compile-time-known name): node N (CallNode `public_send`) recv=SelfNode/ty49 argc=1 arg0ty6
-== test/reject/macro_local_mutated.rb [promote] rc=1
-spinel: test/reject/macro_local_mutated.rb:8: unsupported send with a runtime method name (AOT needs a compile-time-known name): node N (CallNode `public_send`) recv=SelfNode/ty49 argc=1 arg0ty6
 == test/reject/macro_local_receiver.rb [default] rc=1
 spinel: test/reject/macro_local_receiver.rb:9: unsupported send with a runtime method name (AOT needs a compile-time-known name): node N (CallNode `public_send`) recv=SelfNode/ty49 argc=1 arg0ty6
 == test/reject/macro_local_receiver.rb [promote] rc=1
